@@ -1,0 +1,9 @@
+SYNTHETIC DEMO DOCUMENT - NOT A REAL LAND RECORD
+Type: deed
+Reference: DEMO-DEED-1003
+Parcel (internal ID): DV-003
+Dag: 88
+Khatian: KH-1003
+Recorded area: 5.0 decimal
+Date: 2018-03-12
+Party label: DEMO-PARTY-B1

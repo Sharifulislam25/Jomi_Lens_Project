@@ -1,0 +1,9 @@
+SYNTHETIC DEMO DOCUMENT - NOT A REAL LAND RECORD
+Type: khatian
+Reference: DEMO-KH-1002
+Parcel (internal ID): DV-002
+Dag: 210
+Khatian: Kh 2002
+Recorded area: 201.5 sqm
+Date: 2019-02-01
+Party label: DEMO-PARTY-B2

@@ -1,0 +1,9 @@
+SYNTHETIC DEMO DOCUMENT - NOT A REAL LAND RECORD
+Type: khatian
+Reference: DEMO-KH-1023
+Parcel (internal ID): DV-023
+Dag: 540
+Khatian: KH-1023
+Recorded area: 5.0 decimal
+Date: 2021-09-02
+Party label: DEMO-PARTY-B2

@@ -1,0 +1,692 @@
+"""Verification engine: pure, testable functions (no Streamlit, no database).
+
+All inputs are plain dicts/lists. Every check returns the same structured result:
+  {check_id, title, status, summary, evidence[], limitations[], meaning, timestamp}
+Statuses: PASS | REVIEW_REQUIRED | CONFLICT_FOUND | UNAVAILABLE | NOT_RUN.
+A result is never a legal finding: it only compares the synthetic records it is given."""
+import hashlib
+import re
+import unicodedata
+from datetime import date, datetime, timezone
+
+from src import registry_crypto as rc
+from src.geo_tools import to_sqm
+from src.registry_crypto import verify_chain, verify_signature
+
+ENGINE_VERSION = "2.0"
+PASS, REVIEW, CONFLICT, UNAVAILABLE, NOT_RUN = "PASS", "REVIEW_REQUIRED", "CONFLICT_FOUND", "UNAVAILABLE", "NOT_RUN"
+STATUSES = (PASS, REVIEW, CONFLICT, UNAVAILABLE, NOT_RUN)
+DEFAULT_SETTINGS = {"area_tolerance_pct": 2.0, "area_tolerance_abs_sqm": 1.0, "overlap_days": 30,
+                    "required_record_types": ["deed", "khatian"], "mutation_deadline_days": 90, "survey_area_drift_pct": 15.0,
+                    "expected_survey_generations": ["CS", "SA", "RS", "BS"], "as_of_date": None}
+SURVEY_ORDER = ["CS", "SA", "RS", "BS"]
+COMPARABLE_TYPES = ("deed", "khatian", "mutation", "survey reference")
+_STOP = {"dag", "no", "number", "num", "khatian", "kh", "plot", "nr"}
+
+MEANING = {
+    "record_consistency": {
+        PASS: "The compared fictional records agree on the references and areas that they all state. This does not prove the records are real or complete.",
+        REVIEW: "No direct contradiction was found, but something is missing or out of order. A person should look at the items listed.",
+        CONFLICT: "At least two records disagree on a reference, area or date. In a real case this needs checking against the original records.",
+        UNAVAILABLE: "There were not enough records to compare, so no conclusion is possible.",
+        NOT_RUN: "This check has not been run yet."},
+    "conflicting_sales": {
+        PASS: "The simulated transfer history is in a consistent order with no overlapping claims. This is not proof that no problem exists.",
+        REVIEW: "The history is not contradictory by itself, but one detail (such as the recorded holder) does not line up.",
+        CONFLICT: "A rule flagged an inconsistent or overlapping simulated sale. This is a prompt for human review, not proof of fraud.",
+        UNAVAILABLE: "No transactions are recorded for this parcel, so nothing could be evaluated.",
+        NOT_RUN: "This check has not been run yet."},
+    "document_integrity": {
+        PASS: "The checked file is byte-for-byte identical to the copy recorded earlier. It does NOT show the document was originally genuine or legally valid.",
+        REVIEW: "Some documents matched, but others could not be checked. The unchecked ones remain open.",
+        CONFLICT: "A checked file differs from the recorded copy (it was changed, replaced or the wrong file was supplied).",
+        UNAVAILABLE: "No document could be checked (no stored hash or no file).",
+        NOT_RUN: "This check has not been run yet."},
+}
+
+
+MEANING.update({
+    "survey_chain": {
+        PASS: "The survey generations (CS, SA, RS, BS) link to each other through their dag numbers and the area changes stay modest. This does not prove any survey record is real.",
+        REVIEW: "A survey generation is missing or the area changed a lot between generations. A person should read the survey records.",
+        CONFLICT: "A later survey does not point back to the dag of the earlier survey (a broken lineage). In a real case this needs the original khatians.",
+        UNAVAILABLE: "Fewer than two survey generations are recorded, so no lineage can be checked.", NOT_RUN: "This check has not been run yet."},
+    "registration_mutation": {
+        PASS: "The deed registered at the sub-registry has a matching mutation at the AC Land office in the same party label. This is a consistency check of synthetic records only.",
+        REVIEW: "The registration and the mutation do not yet line up (no mutation after the deadline, or the order of dates is odd).",
+        CONFLICT: "The mutation names a different party than the registered deed. In a real case this is a serious mismatch between the two offices' records.",
+        UNAVAILABLE: "There is no registered deed to compare with a mutation.", NOT_RUN: "This check has not been run yet."},
+    "pending_cases": {
+        PASS: "No pending case is recorded in the (synthetic) case register for this parcel. This does not prove that no case exists in the real world.",
+        REVIEW: "A pending case is recorded that does not by itself restrict transfer. Read it before going further.",
+        CONFLICT: "A pending case that restricts transfer (such as an injunction) is recorded. Do not proceed without proper legal advice.",
+        UNAVAILABLE: "The case register is not covered for this parcel, so pending cases were not checked.", NOT_RUN: "This check has not been run yet."},
+    "khas_acquisition": {
+        PASS: "No khas, vested-property or acquisition entry is recorded in the (synthetic) register for this parcel. This does not prove there is none.",
+        REVIEW: "An acquisition is only proposed. Ask the authority for its current status.",
+        CONFLICT: "The parcel is recorded as khas/vested land or as under notified or completed acquisition. A private sale may not be possible.",
+        UNAVAILABLE: "The khas/acquisition register is not covered for this parcel, so it was not checked.", NOT_RUN: "This check has not been run yet."},
+    "document_authenticity": {
+        PASS: "The signature verifies under the SIMULATED issuer key and the ledger holds the same hash. This shows the demo mechanism works; it does not verify any real government document.",
+        REVIEW: "Some documents verified but others could not be checked (no signature or no file).",
+        CONFLICT: "A signature does not verify, the issuer key is unknown, the ledger entry is missing or different, or the ledger itself was altered.",
+        UNAVAILABLE: "No signed document could be checked.", NOT_RUN: "This check has not been run yet."}})
+
+
+_NR = "This check has not been run yet."
+MEANING.update({
+    "registration_mutation": {
+        PASS: "Each registered deed has a later mutation in the land office. The two offices' synthetic records line up.",
+        REVIEW: "The registration and mutation records are not fully linked (no mutation yet, or it was recorded very late). A person should check the mutation status.",
+        CONFLICT: "A mutation is dated BEFORE the deed it should follow, which is an impossible order for a genuine process.",
+        UNAVAILABLE: "There is no registered deed to link to a mutation.", NOT_RUN: _NR},
+    "survey_chain": {
+        PASS: "The survey generations (CS, SA, RS, BS) are consistent with each other and with the current records. Dag numbers are NOT compared across surveys because renumbering is normal.",
+        REVIEW: "Something changed between survey generations (area or land class) that needs an explanation or permission record.",
+        CONFLICT: "The current records disagree with the latest survey on the dag reference or area.",
+        UNAVAILABLE: "Fewer than two survey generations are recorded, so no history can be compared.", NOT_RUN: _NR},
+    "registry_log": {
+        PASS: "The append-only registry log is intact: every entry still matches its hash and links to the previous one. It does not prove the entries were true when written.",
+        REVIEW: "The log could only be partly checked.",
+        CONFLICT: "The registry log was altered after it was written: at least one entry no longer matches its hash or link.",
+        UNAVAILABLE: "No registry log exists for this parcel.", NOT_RUN: _NR},
+    "pending_cases": {
+        PASS: "No active case is recorded in the (synthetic) case register for this parcel.",
+        REVIEW: "The case register could only be partly checked.",
+        CONFLICT: "An active case is recorded against this parcel. A real buyer should not proceed without legal advice.",
+        UNAVAILABLE: "The case register is not available for this parcel, so absence of a case cannot be confirmed.", NOT_RUN: _NR},
+    "khas_acquisition": {
+        PASS: "No active khas, vested-property or acquisition notice is recorded in the (synthetic) register.",
+        REVIEW: "A proposed notice exists. It may later affect the parcel; check its status with the authority.",
+        CONFLICT: "An active or completed khas, vested-property or acquisition entry is recorded. The parcel may not be freely transferable.",
+        UNAVAILABLE: "The khas / acquisition register is not available for this parcel, so absence of a notice cannot be confirmed.", NOT_RUN: _NR},
+})
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_ref(value):
+    """Normalise a dag / khatian reference for comparison without erasing real differences.
+    'Dag No. 0125' -> '125'; 'DAG-125/A' -> '125a'; '125' != '152'. Returns None if nothing meaningful remains."""
+    if value is None:
+        return None
+    s = unicodedata.normalize("NFKC", str(value)).strip().lower()
+    s = "".join(str(unicodedata.digit(c)) if c.isdigit() else c for c in s)        # Bangla digits -> ASCII
+    tokens = [t for t in re.findall(r"[^\W_]+", s) if t not in _STOP]
+    if not tokens:
+        return None
+    return re.sub(r"^0+(?=\d)", "", "".join(tokens))
+
+
+def parse_date(value):
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _result(check_id, title, status, summary, evidence, limitations, now=None):
+    assert status in STATUSES
+    return {"check_id": check_id, "title": title, "status": status, "summary": summary, "evidence": evidence,
+            "limitations": limitations, "meaning": MEANING[check_id][status], "timestamp": now or now_iso()}
+
+
+# ----------------------------------------------------------------------------------------------- check 1
+def check_record_consistency(records, settings=None, now=None) -> dict:
+    cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+    title = "Record consistency"
+    lim = ["Compares only the synthetic records supplied; it cannot tell whether a record is genuine.",
+           "Reference text is normalised (case, 'Dag No.', leading zeros) but different numbers are never treated as equal.",
+           f"Area tolerance: {cfg['area_tolerance_pct']}% or {cfg['area_tolerance_abs_sqm']} m², whichever is larger."]
+    recs = [r for r in (records or []) if r.get("record_type") in COMPARABLE_TYPES and (r.get("survey_gen") in (None, "", "BS"))]
+    if len(recs) < 2:
+        return _result("record_consistency", title, UNAVAILABLE,
+                       f"Only {len(recs)} comparable record(s) found; at least 2 are needed.",
+                       [{"record_id": r.get("record_id"), "record_type": r.get("record_type")} for r in recs], lim, now)
+    evidence, conflicts, review = [], [], []
+    for field, label in (("dag_ref", "Dag / plot reference"), ("khatian_ref", "Khatian reference")):
+        raw = {r["record_id"]: r.get(field) for r in recs}
+        norm = {k: normalize_ref(v) for k, v in raw.items()}
+        present = {k: v for k, v in norm.items() if v is not None}
+        if len(present) < 2:
+            evidence.append({"field": label, "result": "not comparable", "values": raw,
+                             "detail": "Fewer than two records state this field."})
+            review.append(f"{label} is stated in fewer than two records.")
+        elif len(set(present.values())) > 1:
+            conflicts.append(f"{label} differs between records.")
+            evidence.append({"field": label, "result": "CONFLICT", "values": raw, "normalised": norm,
+                             "detail": "After normalisation the references are not the same."})
+        else:
+            evidence.append({"field": label, "result": "match", "values": raw, "normalised": norm,
+                             "detail": "Same reference after normalisation."})
+    areas = {}
+    for r in recs:
+        if r.get("recorded_area") is None:
+            continue
+        try:
+            areas[r["record_id"]] = to_sqm(r["recorded_area"], r.get("area_unit") or "")
+        except (ValueError, TypeError):
+            review.append(f"Record {r['record_id']} has an unreadable area or unit.")
+    if len(areas) < 2:
+        evidence.append({"field": "Recorded area", "result": "not comparable", "detail": "Fewer than two records state a readable area."})
+        review.append("Recorded area is stated in fewer than two records.")
+    else:
+        hi, lo = max(areas.values()), min(areas.values())
+        allowed = max(cfg["area_tolerance_abs_sqm"], hi * cfg["area_tolerance_pct"] / 100)
+        row = {"field": "Recorded area", "values_sqm": {k: round(v, 2) for k, v in areas.items()},
+               "difference_sqm": round(hi - lo, 2), "allowed_sqm": round(allowed, 2)}
+        if hi - lo > allowed:
+            conflicts.append(f"Recorded areas differ by {hi - lo:.1f} m², more than the allowed {allowed:.1f} m².")
+            row.update(result="CONFLICT", detail="The difference is larger than the tolerance.")
+        else:
+            row.update(result="match", detail="Within the tolerance.")
+        evidence.append(row)
+    if any(r.get("record_date") and parse_date(r.get("record_date")) is None for r in recs):
+        review.append("At least one record date could not be read.")
+    have = {r["record_type"] for r in recs}
+    for t in cfg["required_record_types"]:
+        if t not in have:
+            review.append(f"No {t} record is available to compare.")
+            evidence.append({"field": f"Required record: {t}", "result": "missing"})
+    if conflicts:
+        return _result("record_consistency", title, CONFLICT, " ".join(conflicts), evidence, lim, now)
+    if review:
+        return _result("record_consistency", title, REVIEW, "No contradiction found, but: " + " ".join(review), evidence, lim, now)
+    return _result("record_consistency", title, PASS, f"{len(recs)} records agree on every field they share.", evidence, lim, now)
+
+
+# ----------------------------------------------------------------------------------------------- check 2
+def check_conflicting_sales(transactions, records=None, settings=None, now=None) -> dict:
+    cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+    title = "Conflicting or duplicate sales"
+    lim = ["Uses only simulated transactions for this internal parcel ID; real-world fraud cannot be concluded from it.",
+           f"Consecutive transfers within {cfg['rapid_days']} days are flagged as rapid (possible flipping) for review.",
+           "The first seller is assumed to be the starting owner because earlier history is not modelled.",
+           f"Claims by the same seller to different buyers within {cfg['overlap_days']} days are treated as overlapping."]
+    txs = list(transactions or [])
+    if not txs:
+        return _result("conflicting_sales", title, UNAVAILABLE, "No transactions are recorded for this parcel.", [], lim, now)
+    active = [t for t in txs if (t.get("transaction_status") or "").lower() != "cancelled"]
+    if not active:
+        return _result("conflicting_sales", title, PASS, "All recorded transactions were cancelled, so there are no active claims.",
+                       [{"transaction_id": t["transaction_id"], "status": "cancelled"} for t in txs], lim, now)
+    far = date.max
+    active.sort(key=lambda t: (parse_date(t.get("transaction_date")) or far, t["transaction_id"]))
+    conflicts, review, evidence, flagged = [], [], [], set()
+    for t in active:
+        if parse_date(t.get("transaction_date")) is None:
+            review.append(f"Transaction {t['transaction_id']} has no readable date.")
+        if t.get("seller_demo_id") == t.get("buyer_demo_id"):
+            review.append(f"Transaction {t['transaction_id']} has the same party as seller and buyer.")
+    # Rule 1: overlapping claims by one seller on different buyers
+    for i, a in enumerate(active):
+        for b in active[i + 1:]:
+            da, db = parse_date(a.get("transaction_date")), parse_date(b.get("transaction_date"))
+            if a["seller_demo_id"] == b["seller_demo_id"] and a["buyer_demo_id"] != b["buyer_demo_id"] and da and db \
+                    and abs((db - da).days) <= cfg["overlap_days"]:
+                conflicts.append(f"{a['transaction_id']} and {b['transaction_id']}: the same seller claims to sell to two buyers within "
+                                 f"{abs((db - da).days)} days.")
+                evidence.append({"rule": "OVERLAPPING_CLAIMS", "transactions": [a["transaction_id"], b["transaction_id"]],
+                                 "detail": f"Seller {a['seller_demo_id']} -> {a['buyer_demo_id']} and {b['buyer_demo_id']}, {abs((db - da).days)} days apart."})
+                flagged.update([a["transaction_id"], b["transaction_id"]])
+    # Rule 2: walk the ownership chain
+    owner, previous = active[0]["seller_demo_id"], set()
+    for t in active:
+        if t["transaction_id"] not in flagged and t["seller_demo_id"] != owner:
+            if t["seller_demo_id"] in previous:
+                rule, why = "DUPLICATE_SALE", f"{t['seller_demo_id']} already sold this parcel earlier and sells it again."
+            else:
+                rule, why = "CHAIN_BREAK", f"The seller {t['seller_demo_id']} is not the recorded current owner ({owner})."
+            conflicts.append(f"{t['transaction_id']}: {why}")
+            evidence.append({"rule": rule, "transactions": [t["transaction_id"]], "detail": why})
+        previous.add(t["seller_demo_id"])
+        owner = t["buyer_demo_id"]
+    # Rule 4: suspicious rapid transfers (flipping)
+    rapid = [(a, b) for a, b in zip(active, active[1:]) if parse_date(a.get("transaction_date")) and parse_date(b.get("transaction_date"))
+             and 0 <= (parse_date(b["transaction_date"]) - parse_date(a["transaction_date"])).days <= cfg["rapid_days"]]
+    if len(rapid) >= 1 and not conflicts:
+        for a, b in rapid:
+            days = (parse_date(b["transaction_date"]) - parse_date(a["transaction_date"])).days
+            review.append(f"Rapid transfer: {a['transaction_id']} and {b['transaction_id']} are {days} days apart (limit {cfg['rapid_days']}).")
+            evidence.append({"rule": "RAPID_TRANSFER", "transactions": [a["transaction_id"], b["transaction_id"]], "detail": f"{days} days between consecutive transfers."})
+    # Rule 3: last buyer vs recorded holder
+    holders = [(parse_date(r.get("record_date")) or date.min, r["recorded_party_label"]) for r in (records or [])
+               if r.get("record_type") in ("deed", "khatian", "mutation") and r.get("recorded_party_label")]
+    if holders:
+        holder = max(holders)[1]
+        if owner != holder and not conflicts:
+            review.append(f"The last buyer ({owner}) differs from the holder named in the latest record ({holder}).")
+            evidence.append({"rule": "HOLDER_MISMATCH", "detail": f"Last buyer {owner} vs recorded holder {holder}."})
+    if not evidence:
+        evidence.append({"rule": "SEQUENCE_OK", "transactions": [t["transaction_id"] for t in active],
+                         "detail": "Each seller was the previous buyer and there are no overlapping claims."})
+    if conflicts:
+        return _result("conflicting_sales", title, CONFLICT, " ".join(conflicts), evidence, lim, now)
+    if review:
+        return _result("conflicting_sales", title, REVIEW, " ".join(review), evidence, lim, now)
+    return _result("conflicting_sales", title, PASS, f"{len(active)} transaction(s) form a consistent chain.", evidence, lim, now)
+
+
+# ----------------------------------------------------------------------------------------------- check 3
+_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def check_document_integrity(documents, uploaded=None, now=None) -> dict:
+    title = "Document integrity (SHA-256 + issuer signature)"
+    lim = ["A matching hash only shows the file equals the copy whose hash was stored. It does not show the original was authentic, who issued it, "
+           "that any signature is valid, or that it has legal effect.",
+           "Signatures here come from a SYNTHETIC demo issuer key that is public by design: they demonstrate the mechanism, not a real authority."]
+    docs = list(documents or [])
+    uploaded = uploaded or {}
+    if not docs:
+        return _result("document_integrity", title, UNAVAILABLE, "No documents are attached to this parcel.", [], lim, now)
+    evidence, counts = [], {"match": 0, "mismatch": 0, "unchecked": 0}
+    for d in docs:
+        content = uploaded.get(d["document_id"], d.get("content"))
+        row = {"document_id": d["document_id"], "record_id": d.get("record_id"), "file": d.get("filename"),
+               "expected_sha256": d.get("expected_sha256"), "source": "uploaded file" if d["document_id"] in uploaded else "bundled fixture"}
+        exp, sig, pub = d.get("expected_sha256"), d.get("signature_hex"), d.get("issuer_public_key")
+        got = rc_hash = None
+        if content is not None:
+            got = sha256_hex(content)
+            row.update(computed_sha256=got, size_bytes=len(content))
+        sig_state = "not signed"
+        if sig and pub:
+            sig_state = "not checkable (no file)" if got is None else ("valid" if rc.verify_hex(pub, sig, got.encode()) else "INVALID")
+        row["issuer_signature"] = sig_state
+        if exp and not _HEX.match(exp):
+            row.update(result="invalid stored hash", detail="The stored hash is not a valid SHA-256 value.")
+            counts["unchecked"] += 1
+        elif content is None:
+            row.update(result="no file" if exp or sig else "no stored hash", detail="No file was supplied to hash." if exp or sig else "No hash or signature was recorded, so it cannot be checked.")
+            counts["unchecked"] += 1
+        elif not exp and sig_state == "not signed":
+            row.update(result="no stored hash", detail="No hash or signature was recorded for this document, so it cannot be checked.")
+            counts["unchecked"] += 1
+        elif exp and got.lower() != exp.lower():
+            row.update(result="MISMATCH", detail="Computed hash differs from the stored hash." + (" The issuer signature also fails." if sig_state == "INVALID" else ""))
+            counts["mismatch"] += 1
+        elif sig_state == "INVALID":
+            row.update(result="SIGNATURE INVALID", detail="The hash equals the stored value, but the issuer's signature does not verify for this content. "
+                                                         "The stored hash may have been replaced after the file was changed.")
+            counts["mismatch"] += 1
+        else:
+            row.update(result="match", detail="Computed hash equals the stored hash" + (" and the issuer signature verifies." if sig_state == "valid" else " (document is not signed)."))
+            counts["match"] += 1
+        evidence.append(row)
+    if counts["mismatch"]:
+        return _result("document_integrity", title, CONFLICT, f"{counts['mismatch']} document(s) failed the hash or signature check.", evidence, lim, now)
+    if counts["match"] and counts["unchecked"]:
+        return _result("document_integrity", title, REVIEW, f"{counts['match']} matched; {counts['unchecked']} could not be checked.", evidence, lim, now)
+    if counts["match"]:
+        return _result("document_integrity", title, PASS, f"All {counts['match']} checked document(s) match their stored hash" +
+                       (" and signature." if all(e.get("issuer_signature") == "valid" for e in evidence) else "."), evidence, lim, now)
+    return _result("document_integrity", title, UNAVAILABLE, "No document could be checked.", evidence, lim, now)
+
+
+# ----------------------------------------------------------------------------------------------- new checks
+def check_registration_mutation(records, settings=None, now=None, today=None) -> dict:
+    """Links the sub-registry (deed registration) and the AC Land office (mutation): order, lag and completeness."""
+    cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+    title = "Registration -> mutation link"
+    lim = ["Compares only the synthetic deed and mutation records supplied.",
+           f"A mutation more than {cfg['mutation_lag_days']} days after registration is treated as late (configurable).",
+           "A mutation dated before its deed is treated as an impossible order, not as a clerical difference."]
+    recs = list(records or [])
+    deeds = [r for r in recs if r.get("record_type") == "deed"]
+    muts = [r for r in recs if r.get("record_type") == "mutation"]
+    if not deeds:
+        return _result("registration_mutation", title, UNAVAILABLE, "No registered deed is available to link to a mutation.", [], lim, now)
+    ref = today or datetime.now(timezone.utc).date()
+    conflicts, review, evidence = [], [], []
+    for d in deeds:
+        dd = parse_date(d.get("record_date"))
+        if dd is None:
+            review.append(f"Deed {d['record_id']} has no readable date.")
+            continue
+        later = [m for m in muts if (parse_date(m.get("record_date")) or date.min) >= dd]
+        earlier = [m for m in muts if parse_date(m.get("record_date")) and parse_date(m.get("record_date")) < dd]
+        if earlier:
+            m = earlier[0]
+            conflicts.append(f"Mutation {m['record_id']} ({m['record_date']}) is dated before deed {d['record_id']} ({d['record_date']}).")
+            evidence.append({"deed": d["record_id"], "mutation": m["record_id"], "result": "CONFLICT", "detail": "Mutation precedes registration."})
+        elif not later:
+            age = (ref - dd).days
+            review.append(f"No mutation is recorded for deed {d['record_id']} ({age} days after registration).")
+            evidence.append({"deed": d["record_id"], "result": "no mutation", "detail": f"{age} days since registration; mutation lag limit {cfg['mutation_lag_days']} days."})
+        else:
+            lag = (min(parse_date(m["record_date"]) for m in later) - dd).days
+            ok = lag <= cfg["mutation_lag_days"]
+            evidence.append({"deed": d["record_id"], "mutation": later[0]["record_id"], "lag_days": lag, "result": "ok" if ok else "late"})
+            if not ok:
+                review.append(f"Mutation for deed {d['record_id']} was recorded {lag} days after registration (limit {cfg['mutation_lag_days']}).")
+    if conflicts:
+        return _result("registration_mutation", title, CONFLICT, " ".join(conflicts), evidence, lim, now)
+    if review:
+        return _result("registration_mutation", title, REVIEW, " ".join(review), evidence, lim, now)
+    return _result("registration_mutation", title, PASS, f"{len(deeds)} registered deed(s) each have a timely mutation.", evidence, lim, now)
+
+
+_SURVEY_ORDER = {"CS": 0, "SA": 1, "RS": 2, "BS": 3}
+
+
+def check_survey_chain(surveys, records=None, settings=None, now=None) -> dict:
+    cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+    title = "Survey chain (CS -> SA -> RS -> BS)"
+    lim = ["Dag and khatian numbers are NOT compared between survey generations: renumbering between surveys is normal.",
+           f"Area changes above {cfg['survey_area_drift_pct']}% between consecutive surveys, and any change of land class, are flagged for explanation.",
+           "Uses synthetic survey rows only; real survey maps and records are not accessed."]
+    sv = sorted([s_ for s_ in (surveys or []) if s_.get("survey_type") in _SURVEY_ORDER], key=lambda x: (_SURVEY_ORDER[x["survey_type"]], x.get("survey_year") or 0))
+    if len(sv) < 2:
+        return _result("survey_chain", title, UNAVAILABLE, f"Only {len(sv)} survey generation(s) recorded; at least 2 are needed.", [{"survey": x["survey_type"], "year": x.get("survey_year")} for x in sv], lim, now)
+    conflicts, review, evidence = [], [], []
+    for a_, b_ in zip(sv, sv[1:]):
+        try:
+            sa, sb = to_sqm(a_["recorded_area"], a_["area_unit"]), to_sqm(b_["recorded_area"], b_["area_unit"])
+            drift = abs(sb - sa) / max(sa, sb) * 100
+        except (ValueError, TypeError, KeyError, ZeroDivisionError):
+            review.append(f"{a_['survey_type']} -> {b_['survey_type']}: area is unreadable."); continue
+        row = {"step": f"{a_['survey_type']} ({a_.get('survey_year')}) -> {b_['survey_type']} ({b_.get('survey_year')})", "area_change_pct": round(drift, 1),
+               "land_class": f"{a_.get('land_class')} -> {b_.get('land_class')}", "dag_numbers": "not compared across surveys"}
+        flags = []
+        if drift > cfg["survey_area_drift_pct"]:
+            flags.append(f"area changed by {drift:.0f}%")
+        if (a_.get("land_class") or "") != (b_.get("land_class") or ""):
+            flags.append(f"land class changed from {a_.get('land_class')} to {b_.get('land_class')}")
+        row["result"] = "REVIEW: " + "; ".join(flags) if flags else "ok"
+        if flags:
+            review.append(f"{a_['survey_type']} -> {b_['survey_type']}: " + "; ".join(flags) + ".")
+        evidence.append(row)
+    latest = sv[-1]
+    for r in [r for r in (records or []) if r.get("record_type") in ("deed", "khatian") and r.get("dag_ref")]:
+        if normalize_ref(r["dag_ref"]) != normalize_ref(latest.get("dag_ref")):
+            conflicts.append(f"Record {r['record_id']} cites dag {r['dag_ref']} but the latest survey ({latest['survey_type']}) cites dag {latest.get('dag_ref')}.")
+            evidence.append({"step": "current records vs latest survey", "record": r["record_id"], "result": "CONFLICT", "detail": "Dag reference differs."})
+    try:
+        for r in [r for r in (records or []) if r.get("record_type") == "khatian" and r.get("recorded_area") is not None]:
+            sa, sb = to_sqm(latest["recorded_area"], latest["area_unit"]), to_sqm(r["recorded_area"], r["area_unit"])
+            if abs(sa - sb) > max(cfg["area_tolerance_abs_sqm"], max(sa, sb) * cfg["area_tolerance_pct"] / 100):
+                conflicts.append(f"Khatian {r['record_id']} area differs from the latest survey area.")
+                evidence.append({"step": "khatian vs latest survey", "record": r["record_id"], "result": "CONFLICT", "detail": "Area differs beyond tolerance."})
+    except (ValueError, TypeError, KeyError):
+        review.append("The latest survey area could not be compared to the khatian.")
+    if conflicts:
+        return _result("survey_chain", title, CONFLICT, " ".join(conflicts), evidence, lim, now)
+    if review:
+        return _result("survey_chain", title, REVIEW, " ".join(review), evidence, lim, now)
+    return _result("survey_chain", title, PASS, f"{len(sv)} survey generations are consistent with each other and with the current records.", evidence, lim, now)
+
+
+def check_registry_log(entries, now=None) -> dict:
+    title = "Registry log integrity (hash chain)"
+    lim = ["Detects edits, removals, insertions and reordering of log entries after they were written.",
+           "Cannot show that an entry was true when written, or who wrote it; a real registry would also sign each entry and anchor the head hash outside its own system."]
+    entries = list(entries or [])
+    if not entries:
+        return _result("registry_log", title, UNAVAILABLE, "No registry log exists for this parcel.", [], lim, now)
+    res = rc.verify_chain(entries)
+    ev = [{"entries_checked": res["checked"], "chain_head": sorted(entries, key=lambda e: e["seq"])[-1]["entry_hash"][:16] + "..."}] + \
+         [{"seq": p["seq"], "problem": p["reason"]} for p in res["problems"]]
+    if res["ok"]:
+        return _result("registry_log", title, PASS, f"All {res['checked']} log entries are intact and correctly linked.", ev, lim, now)
+    return _result("registry_log", title, CONFLICT, f"{len(res['problems'])} problem(s) found; first at entry {res['problems'][0]['seq']}: {res['problems'][0]['reason']}.", ev, lim, now)
+
+
+_ACTIVE_CASE = {"filed", "pending", "stay_order"}
+
+
+def check_pending_cases(cases, register_available=True, now=None) -> dict:
+    title = "Pending cases"
+    lim = ["Reads only a SYNTHETIC case register built for this demo; real courts and registers are not queried.",
+           "'No case found' is meaningful only if the register covered this parcel; otherwise the check is UNAVAILABLE."]
+    if not register_available:
+        return _result("pending_cases", title, UNAVAILABLE, "The case register is not available for this parcel.", [], lim, now)
+    cs = list(cases or [])
+    active = [c for c in cs if (c.get("case_status") or "").lower() in _ACTIVE_CASE]
+    ev = [{"case_id": c["case_id"], "court": c.get("court_level"), "status": c.get("case_status"), "filed": c.get("filed_date"), "summary": c.get("summary")} for c in cs]
+    if active:
+        return _result("pending_cases", title, CONFLICT, f"{len(active)} active case(s) recorded: " + ", ".join(c["case_id"] for c in active) + ".", ev, lim, now)
+    if cs:
+        return _result("pending_cases", title, PASS, f"No active case; {len(cs)} closed case(s) listed.", ev, lim, now)
+    return _result("pending_cases", title, PASS, "No case found in the register for this parcel.", [{"register": "synthetic case register", "result": "no entry"}], lim, now)
+
+
+def check_khas_acquisition(notices, register_available=True, now=None) -> dict:
+    title = "Khas / acquisition status"
+    lim = ["Reads only a SYNTHETIC register of khas, vested-property and acquisition notices; real government registers are not queried.",
+           "'No notice found' is meaningful only if the register covered this parcel; otherwise the check is UNAVAILABLE."]
+    if not register_available:
+        return _result("khas_acquisition", title, UNAVAILABLE, "The khas / acquisition register is not available for this parcel.", [], lim, now)
+    ns = list(notices or [])
+    ev = [{"notice_id": n["notice_id"], "type": n.get("notice_type"), "status": n.get("notice_status"), "date": n.get("notice_date"),
+           "authority": n.get("authority_label"), "summary": n.get("summary")} for n in ns]
+    hard = [n for n in ns if (n.get("notice_status") or "").lower() in ("active", "completed")]
+    soft = [n for n in ns if (n.get("notice_status") or "").lower() == "proposed"]
+    if hard:
+        return _result("khas_acquisition", title, CONFLICT, f"{len(hard)} active or completed notice(s): " + ", ".join(n["notice_id"] for n in hard) + ".", ev, lim, now)
+    if soft:
+        return _result("khas_acquisition", title, REVIEW, f"{len(soft)} proposed notice(s): " + ", ".join(n["notice_id"] for n in soft) + ".", ev, lim, now)
+    if ns:
+        return _result("khas_acquisition", title, PASS, f"Only withdrawn notice(s) listed ({len(ns)}).", ev, lim, now)
+    return _result("khas_acquisition", title, PASS, "No khas, vested-property or acquisition notice found in the register.", [{"register": "synthetic khas / acquisition register", "result": "no entry"}], lim, now)
+
+
+# ----------------------------------------------------------------------------------------------- overall
+def _as_of(settings):
+    return parse_date(settings.get("as_of_date")) or date.today()
+
+
+# ----------------------------------------------------------------------------------------------- check: survey chain
+def check_survey_chain(records, settings=None, now=None) -> dict:
+    cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+    title = "Survey generations (CS -> SA -> RS -> BS)"
+    lim = ["Compares only the synthetic survey references supplied.", "Each later survey must name the earlier survey's dag (prev_dag_ref); renumbering is allowed only if it is declared.",
+           f"Area drift between neighbouring generations above {cfg['survey_area_drift_pct']}% needs review."]
+    gens = {}
+    for r in records or []:
+        g = (r.get("survey_gen") or "").upper()
+        if g in SURVEY_ORDER:
+            gens[g] = r
+    if len(gens) < 2:
+        return _result("survey_chain", title, UNAVAILABLE, f"Only {len(gens)} survey generation(s) recorded; at least 2 are needed.", [{"generations": sorted(gens)}], lim, now)
+    present = [g for g in SURVEY_ORDER if g in gens]
+    conflicts, review, evidence = [], [], []
+    for g in cfg["expected_survey_generations"]:
+        if g not in gens:
+            review.append(f"The {g} survey record is missing.")
+            evidence.append({"generation": g, "result": "missing"})
+    for a, b in zip(present, present[1:]):
+        ra, rb = gens[a], gens[b]
+        prev, dag = normalize_ref(rb.get("prev_dag_ref")), normalize_ref(ra.get("dag_ref"))
+        row = {"link": f"{a} -> {b}", f"{a} dag": ra.get("dag_ref"), f"{b} declares previous dag": rb.get("prev_dag_ref")}
+        if prev is None:
+            review.append(f"{b} does not declare which {a} dag it came from.")
+            row["result"] = "no lineage declared"
+        elif prev != dag:
+            conflicts.append(f"{b} says it came from dag {rb.get('prev_dag_ref')}, but the {a} record is dag {ra.get('dag_ref')}.")
+            row["result"] = "LINEAGE BREAK"
+        else:
+            row["result"] = "ok"
+        try:
+            xa, xb = to_sqm(ra["recorded_area"], ra["area_unit"]), to_sqm(rb["recorded_area"], rb["area_unit"])
+            drift = abs(xb - xa) / max(xa, xb) * 100
+            row["area_drift_pct"] = round(drift, 1)
+            if drift > cfg["survey_area_drift_pct"]:
+                review.append(f"Area changed by {drift:.1f}% between {a} and {b}.")
+        except (KeyError, TypeError, ValueError):
+            review.append(f"Area could not be compared between {a} and {b}.")
+        evidence.append(row)
+    if conflicts:
+        return _result("survey_chain", title, CONFLICT, " ".join(conflicts), evidence, lim, now)
+    if review:
+        return _result("survey_chain", title, REVIEW, " ".join(review), evidence, lim, now)
+    return _result("survey_chain", title, PASS, f"{len(present)} survey generations link correctly.", evidence, lim, now)
+
+
+# ----------------------------------------------------------------------------------------------- check: registration vs mutation
+def check_registration_mutation(records, settings=None, now=None) -> dict:
+    cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+    title = "Registration (sub-registry) vs mutation (AC Land)"
+    asof = _as_of(cfg)
+    lim = ["Registration and mutation are held by different offices; this compares only the synthetic copies of both.",
+           f"The {cfg['mutation_deadline_days']}-day deadline is an illustrative setting, not a statement of the legal time limit.",
+           "A late mutation is shown as evidence but not flagged; a missing one after the deadline is flagged."]
+    deeds = [r for r in records or [] if r.get("record_type") == "deed" and parse_date(r.get("record_date"))]
+    muts = [r for r in records or [] if r.get("record_type") == "mutation"]
+    if not deeds:
+        return _result("registration_mutation", title, UNAVAILABLE, "No registered deed with a readable date was found.", [], lim, now)
+    deed = max(deeds, key=lambda r: parse_date(r["record_date"]))
+    dd = parse_date(deed["record_date"])
+    ev = [{"record": deed["record_id"], "type": "deed (registration)", "date": deed["record_date"], "party": deed.get("recorded_party_label")}]
+    if not muts:
+        days = (asof - dd).days
+        ev.append({"result": "no mutation", "days_since_registration": days, "deadline_days": cfg["mutation_deadline_days"], "as_of": asof.isoformat()})
+        if days > cfg["mutation_deadline_days"]:
+            return _result("registration_mutation", title, REVIEW, f"No mutation is recorded {days} days after registration (deadline setting {cfg['mutation_deadline_days']} days).", ev, lim, now)
+        return _result("registration_mutation", title, PASS, f"No mutation yet, but only {days} days have passed (within the {cfg['mutation_deadline_days']}-day setting).", ev, lim, now)
+    mut = max(muts, key=lambda r: parse_date(r.get("record_date")) or date.min)
+    md = parse_date(mut.get("record_date"))
+    ev.append({"record": mut["record_id"], "type": "mutation (AC Land)", "date": mut.get("record_date"), "party": mut.get("recorded_party_label")})
+    pd_, pm = deed.get("recorded_party_label"), mut.get("recorded_party_label")
+    if pd_ and pm and pd_ != pm:
+        ev.append({"result": "PARTY MISMATCH", "detail": f"Deed names {pd_}; mutation names {pm}."})
+        return _result("registration_mutation", title, CONFLICT, f"The mutation names {pm} but the registered deed names {pd_}.", ev, lim, now)
+    if md and md < dd:
+        ev.append({"result": "ORDER", "detail": "The mutation is dated before the deed."})
+        return _result("registration_mutation", title, REVIEW, "The mutation is dated before the deed it should follow.", ev, lim, now)
+    if not pd_ or not pm:
+        ev.append({"result": "party not stated"})
+        return _result("registration_mutation", title, REVIEW, "A party label is missing on the deed or the mutation, so they cannot be matched.", ev, lim, now)
+    late = md and (md - dd).days > cfg["mutation_deadline_days"]
+    ev.append({"result": "match", "days_to_mutation": (md - dd).days if md else None, "note": "mutation was later than the deadline setting (shown, not flagged)" if late else ""})
+    return _result("registration_mutation", title, PASS, "The mutation matches the registered deed.", ev, lim, now)
+
+
+# ----------------------------------------------------------------------------------------------- check: pending cases / khas
+def _coverage(coverage, key):
+    return bool((coverage or {}).get(key))
+
+
+def check_pending_cases(cases, coverage=None, now=None) -> dict:
+    title = "Pending cases (synthetic case register)"
+    lim = ["Reads only a SYNTHETIC case register made by the team; the real court systems are not queried.", "Absence of a record is not proof that no case exists."]
+    if not _coverage(coverage, "case_register"):
+        return _result("pending_cases", title, UNAVAILABLE, "The case register is not covered for this parcel.", [], lim, now)
+    rows = list(cases or [])
+    pending = [c for c in rows if (c.get("status") or "").lower() == "pending"]
+    ev = [{"case_id": c["case_id"], "type": c.get("case_type"), "court": c.get("court_label"), "status": c.get("status"), "filed": c.get("filed_date"),
+           "restricts_transfer": bool(c.get("restricts_transfer"))} for c in rows]
+    if any(c.get("restricts_transfer") for c in pending):
+        return _result("pending_cases", title, CONFLICT, "A pending case that restricts transfer is recorded.", ev, lim, now)
+    if pending:
+        return _result("pending_cases", title, REVIEW, f"{len(pending)} pending case(s) recorded that do not restrict transfer by themselves.", ev, lim, now)
+    return _result("pending_cases", title, PASS, "No pending case is recorded." + (f" ({len(rows)} closed case(s) listed.)" if rows else ""), ev or [{"result": "no cases on record"}], lim, now)
+
+
+def check_khas_acquisition(entries, coverage=None, now=None) -> dict:
+    title = "Khas / vested / acquisition status (synthetic register)"
+    lim = ["Reads only a SYNTHETIC register made by the team; real khas, vested-property and acquisition records are not queried.", "Absence of a record is not proof of free title."]
+    if not _coverage(coverage, "khas_register"):
+        return _result("khas_acquisition", title, UNAVAILABLE, "The khas/acquisition register is not covered for this parcel.", [], lim, now)
+    rows = list(entries or [])
+    ev = [{"entry_id": e["entry_id"], "type": e.get("status_type"), "authority": e.get("authority_label"), "notice": e.get("notice_ref"), "date": e.get("notice_date"),
+           "status": e.get("status")} for e in rows]
+    live = [e for e in rows if (e.get("status") or "").lower() != "released"]
+    block = [e for e in live if e.get("status_type") in ("khas", "vested") or (e.get("status_type") == "acquisition" and (e.get("status") or "").lower() in ("notified", "completed"))]
+    if block:
+        return _result("khas_acquisition", title, CONFLICT, f"Recorded as {block[0]['status_type']} ({block[0].get('status')}).", ev, lim, now)
+    if live:
+        return _result("khas_acquisition", title, REVIEW, "An acquisition is recorded as proposed.", ev, lim, now)
+    return _result("khas_acquisition", title, PASS, "No khas, vested or acquisition entry is recorded." + (" (A released entry is listed.)" if rows else ""), ev or [{"result": "no entries on record"}], lim, now)
+
+
+# ----------------------------------------------------------------------------------------------- check: authenticity (simulated)
+def check_document_authenticity(documents, ledger=None, issuer_keys=None, uploaded=None, now=None) -> dict:
+    title = "Document authenticity (simulated issuer signature + ledger)"
+    lim = ["The issuer is SIMULATED by the project team (a public demo key). This is not a government signature and no real document is verified.",
+           "A valid signature shows the file is the one the simulated issuer signed; it does not show the content is true or legally effective.",
+           "The ledger is append-only by design here; a real deployment would need independent operators."]
+    docs = list(documents or [])
+    uploaded = uploaded or {}
+    if not docs:
+        return _result("document_authenticity", title, UNAVAILABLE, "No documents are attached to this parcel.", [], lim, now)
+    chain = verify_chain(ledger or [])
+    by_doc = {e["doc_id"]: e for e in (ledger or [])}
+    keys = issuer_keys or {}
+    ev, counts = [], {"valid": 0, "invalid": 0, "unchecked": 0}
+    for d in docs:
+        content = uploaded.get(d["document_id"], d.get("content"))
+        row = {"document_id": d["document_id"], "signer": d.get("signer_kid")}
+        if not d.get("signature") or not d.get("expected_sha256"):
+            row.update(result="no signature recorded"); counts["unchecked"] += 1
+        elif content is None:
+            row.update(result="no file"); counts["unchecked"] += 1
+        else:
+            got, problems = sha256_hex(content), []
+            pub = keys.get(d.get("signer_kid"))
+            if pub is None:
+                problems.append("issuer key not recognised")
+            elif not verify_signature(pub, got, d["signature"]):
+                problems.append("the signature does not verify for this file")
+            e = by_doc.get(d["document_id"])
+            if e is None:
+                problems.append("no ledger entry for this document")
+            elif e["sha256"] != d["expected_sha256"]:
+                problems.append("the ledger hash differs from the stored hash")
+            row.update(computed_sha256=got, ledger_entry=e["entry_index"] if e else None)
+            if problems:
+                row.update(result="INVALID", problems="; ".join(problems)); counts["invalid"] += 1
+            else:
+                row.update(result="valid"); counts["valid"] += 1
+        ev.append(row)
+    ev.append({"ledger_chain": "intact" if chain["ok"] else "BROKEN", "entries_checked": chain["checked"], "detail": chain["reason"]})
+    if not chain["ok"]:
+        return _result("document_authenticity", title, CONFLICT, f"The ledger is broken at entry {chain['bad_index']}: {chain['reason']}.", ev, lim, now)
+    if counts["invalid"]:
+        return _result("document_authenticity", title, CONFLICT, f"{counts['invalid']} document(s) failed signature or ledger verification.", ev, lim, now)
+    if counts["valid"] and counts["unchecked"]:
+        return _result("document_authenticity", title, REVIEW, f"{counts['valid']} verified; {counts['unchecked']} could not be checked.", ev, lim, now)
+    if counts["valid"]:
+        return _result("document_authenticity", title, PASS, f"All {counts['valid']} signed document(s) verify and appear in an intact ledger.", ev, lim, now)
+    return _result("document_authenticity", title, UNAVAILABLE, "No signed document could be checked.", ev, lim, now)
+
+
+def overall_status(results) -> str:
+    """Preserves uncertainty: PASS only if every check ran and passed."""
+    st = [r["status"] for r in results]
+    if not st:
+        return NOT_RUN
+    if CONFLICT in st:
+        return CONFLICT
+    if all(s == UNAVAILABLE for s in st):
+        return UNAVAILABLE
+    if all(s == PASS for s in st):
+        return PASS
+    return REVIEW
+
+
+def run_verification(parcel_id, records, transactions, documents, settings=None, uploaded=None, now=None, extra=None) -> dict:
+    """Run the checks. Without `extra` only the original three run. With `extra` ({surveys, pending_cases, khas_notices, ledger, registers})
+    all eight run, in this order."""
+    cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+    ts = now or now_iso()
+    results = [check_record_consistency(records, cfg, ts)]
+    if extra is not None:
+        results.append(check_registration_mutation(records, cfg, ts, today=parse_date(ts)))
+        results.append(check_survey_chain(extra.get("surveys"), records, cfg, ts))
+    results += [check_conflicting_sales(transactions, records, cfg, ts), check_document_integrity(documents, uploaded, ts)]
+    if extra is not None:
+        reg = extra.get("registers") or {}
+        results += [check_registry_log(extra.get("ledger"), ts),
+                    check_pending_cases(extra.get("pending_cases"), bool(reg.get("pending_cases")), ts),
+                    check_khas_acquisition(extra.get("khas_notices"), bool(reg.get("khas_acquisition")), ts)]
+    return {"parcel_id": parcel_id, "created_at": ts, "engine_version": "2.0" if extra is not None else ENGINE_VERSION, "settings": cfg,
+            "uploaded_documents": sorted((uploaded or {}).keys()), "overall_status": overall_status(results), "results": results}

@@ -1,0 +1,9 @@
+SYNTHETIC DEMO DOCUMENT - NOT A REAL LAND RECORD
+Type: khatian
+Reference: DEMO-KH-1024
+Parcel (internal ID): DV-024
+Dag: 539
+Khatian: KH-1024
+Recorded area: 5.0 decimal
+Date: 2014-08-19
+Party label: DEMO-PARTY-B1

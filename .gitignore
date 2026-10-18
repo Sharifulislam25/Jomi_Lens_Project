@@ -1,0 +1,17 @@
+# Python cache and virtual environment
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+cache/
+.pytest_cache/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Generated files
+reports/*.pdf
+data/verify/verify.sqlite

@@ -1,0 +1,16 @@
+streamlit>=1.40
+folium
+streamlit-folium
+geopandas
+shapely
+pyproj
+pandas
+numpy
+opencv-python-headless
+pillow
+plotly
+reportlab
+cryptography
+qrcode[pil]
+rasterio
+pystac-client

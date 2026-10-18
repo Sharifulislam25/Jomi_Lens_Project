@@ -1,0 +1,9 @@
+SYNTHETIC DEMO DOCUMENT - NOT A REAL LAND RECORD
+Type: deed
+Reference: DEMO-DEED-1017
+Parcel (internal ID): DV-017
+Dag: 125
+Khatian: KH-1017
+Recorded area: 5.0 decimal
+Date: 2022-05-10
+Party label: DEMO-PARTY-B1

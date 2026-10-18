@@ -1,0 +1,206 @@
+[
+ {
+  "name": "Dhaka University of Engineering and Technology (DUET), Gazipur",
+  "lat": 24.017624,
+  "lon": 90.418639,
+  "kind": "amenity: university",
+  "osm_id": 974288315
+ },
+ {
+  "name": "শহিদ বরকত স্টেডিয়াম",
+  "lat": 23.998211,
+  "lon": 90.425304,
+  "kind": "leisure: stadium",
+  "osm_id": 1271921139
+ },
+ {
+  "name": "Dighi",
+  "lat": 24.001675,
+  "lon": 90.424356,
+  "kind": "water: lake",
+  "osm_id": 481572755
+ },
+ {
+  "name": "Bhawal Raj Bari Field",
+  "lat": 23.999438,
+  "lon": 90.425865,
+  "kind": "leisure: stadium",
+  "osm_id": 481582685
+ },
+ {
+  "name": "BRRI Lake",
+  "lat": 23.992774,
+  "lon": 90.406127,
+  "kind": "water: pond",
+  "osm_id": 761280303
+ },
+ {
+  "name": "Flamingo Fashion Ltd 2",
+  "lat": 24.009231,
+  "lon": 90.414827,
+  "kind": "building: industrial",
+  "osm_id": 536545298
+ },
+ {
+  "name": "Rani Bilasmoni Government Boys High School",
+  "lat": 23.999375,
+  "lon": 90.424806,
+  "kind": "amenity: school",
+  "osm_id": 672848107
+ },
+ {
+  "name": "New Lab Building",
+  "lat": 24.016738,
+  "lon": 90.419142,
+  "kind": "building: yes",
+  "osm_id": 1064469548
+ },
+ {
+  "name": "New Academic Building",
+  "lat": 24.017226,
+  "lon": 90.419202,
+  "kind": "building: yes",
+  "osm_id": 439057944
+ },
+ {
+  "name": "Bongotaj Auditorium",
+  "lat": 23.995685,
+  "lon": 90.4236,
+  "kind": "building: yes",
+  "osm_id": 781010400
+ },
+ {
+  "name": "STA Hall",
+  "lat": 24.017694,
+  "lon": 90.420111,
+  "kind": "building: yes",
+  "osm_id": 439068712
+ },
+ {
+  "name": "D. Jahirul Islam Training Complex",
+  "lat": 23.991699,
+  "lon": 90.408299,
+  "kind": "building: yes",
+  "osm_id": 761216948
+ },
+ {
+  "name": "KNI Hall",
+  "lat": 24.018356,
+  "lon": 90.42006,
+  "kind": "building: yes",
+  "osm_id": 439058084
+ },
+ {
+  "name": "MC Hall Extension",
+  "lat": 24.017362,
+  "lon": 90.4187,
+  "kind": "building: yes",
+  "osm_id": 1064469553
+ },
+ {
+  "name": "Teacher's Dormetori",
+  "lat": 24.017772,
+  "lon": 90.417284,
+  "kind": "building: yes",
+  "osm_id": 439057791
+ },
+ {
+  "name": "Mirar agro",
+  "lat": 24.00032,
+  "lon": 90.427813,
+  "kind": "building: yes",
+  "osm_id": 1061239290
+ },
+ {
+  "name": "KNI Hall Extension",
+  "lat": 24.018672,
+  "lon": 90.420055,
+  "kind": "building: yes",
+  "osm_id": 439068916
+ },
+ {
+  "name": "S.M. Hall",
+  "lat": 24.018537,
+  "lon": 90.419489,
+  "kind": "building: yes",
+  "osm_id": 1064469555
+ },
+ {
+  "name": "F.R. Khan Hall",
+  "lat": 24.018777,
+  "lon": 90.418808,
+  "kind": "building: yes",
+  "osm_id": 1064469556
+ },
+ {
+  "name": "Central Jame Masjid",
+  "lat": 24.017553,
+  "lon": 90.419274,
+  "kind": "building: yes",
+  "osm_id": 439057819
+ },
+ {
+  "name": "BRRI Progoti Primary School",
+  "lat": 23.990107,
+  "lon": 90.409097,
+  "kind": "building: yes",
+  "osm_id": 760886723
+ },
+ {
+  "name": "Raj Shoshanshwari- Shiv Mondir",
+  "lat": 24.006929,
+  "lon": 90.430628,
+  "kind": "building: yes",
+  "osm_id": 1099482967
+ },
+ {
+  "name": "MC Hall",
+  "lat": 24.017424,
+  "lon": 90.418163,
+  "kind": "building: yes",
+  "osm_id": 1064469560
+ },
+ {
+  "name": "Bhawal Estate",
+  "lat": 24.000697,
+  "lon": 90.425544,
+  "kind": "building: yes",
+  "osm_id": 867700013
+ },
+ {
+  "name": "Academic Building Extension",
+  "lat": 24.017723,
+  "lon": 90.417979,
+  "kind": "building: yes",
+  "osm_id": 1064469559
+ },
+ {
+  "name": "BRRI Museum",
+  "lat": 23.99186,
+  "lon": 90.408401,
+  "kind": "building: yes",
+  "osm_id": 761214563
+ },
+ {
+  "name": "DUET Admission Preparation with PSZ",
+  "lat": 24.016936,
+  "lon": 90.4133,
+  "kind": "building: retail",
+  "osm_id": 1064417718
+ },
+ {
+  "name": "Joydebpur Junction (railway station)",
+  "name_bn": "জয়দেবপুর জংশন",
+  "lat": 23.998039,
+  "lon": 90.420312,
+  "kind": "railway station",
+  "source": "OpenStreetMap Nominatim"
+ },
+ {
+  "name": "Sadar Hospital Road, Rathkhola",
+  "lat": 23.993742,
+  "lon": 90.42485,
+  "kind": "road",
+  "source": "OpenStreetMap Nominatim"
+ }
+]

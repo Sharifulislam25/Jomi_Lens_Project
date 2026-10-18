@@ -1,0 +1,9 @@
+SYNTHETIC DEMO DOCUMENT - NOT A REAL LAND RECORD
+Type: khatian
+Reference: DEMO-KH-1006
+Parcel (internal ID): DV-006
+Dag: 125
+Khatian: KH-1006
+Recorded area: 5.0 decimal
+Date: 2019-01-10
+Party label: DEMO-PARTY-B1
